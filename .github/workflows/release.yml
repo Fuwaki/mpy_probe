@@ -42,29 +42,29 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux' && !matrix.cross
+        if: ${{ runner.os == 'Linux' && !matrix.cross }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev pkg-config
 
       - name: Install cross
-        if: matrix.cross
+        if: ${{ matrix.cross }}
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (cross)
-        if: matrix.cross
+        if: ${{ matrix.cross }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build (native)
-        if: !matrix.cross
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
+        if: ${{ runner.os != 'Windows' }}
         run: cp target/${{ matrix.target }}/release/mpy_probe ${{ matrix.artifact }}
 
       - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
+        if: ${{ runner.os == 'Windows' }}
         run: cp target/${{ matrix.target }}/release/mpy_probe.exe ${{ matrix.artifact }}
 
       - name: Upload artifact
