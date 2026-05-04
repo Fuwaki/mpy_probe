@@ -21,9 +21,6 @@ jobs:
             os: ubuntu-latest
             artifact: mpy_probe-linux-arm64
             cross: true
-          - target: x86_64-apple-darwin
-            os: macos-13
-            artifact: mpy_probe-macos-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: mpy_probe-macos-arm64
@@ -99,8 +96,6 @@ jobs:
             artifacts/mpy_probe-linux-amd64.sha256
             artifacts/mpy_probe-linux-arm64
             artifacts/mpy_probe-linux-arm64.sha256
-            artifacts/mpy_probe-macos-amd64
-            artifacts/mpy_probe-macos-amd64.sha256
             artifacts/mpy_probe-macos-arm64
             artifacts/mpy_probe-macos-arm64.sha256
             artifacts/mpy_probe-windows-amd64.exe
