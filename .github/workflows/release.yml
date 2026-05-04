@@ -17,9 +17,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: mpy_probe-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: mpy_probe-linux-arm64
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: mpy_probe-macos-arm64
@@ -92,8 +89,6 @@ jobs:
           files: |
             artifacts/mpy_probe-linux-amd64
             artifacts/mpy_probe-linux-amd64.sha256
-            artifacts/mpy_probe-linux-arm64
-            artifacts/mpy_probe-linux-arm64.sha256
             artifacts/mpy_probe-macos-arm64
             artifacts/mpy_probe-macos-arm64.sha256
             artifacts/mpy_probe-windows-amd64.exe
