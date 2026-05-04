@@ -7,6 +7,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Abstraction over a byte-stream connection to a MicroPython device.
 ///
 /// Implementors include serial port and (future) WebREPL.
+#[allow(dead_code)]
 pub trait Connection {
     /// Read exactly `n` bytes, or fail on timeout.
     fn read_exact(&mut self, n: usize, timeout: Duration) -> Result<Vec<u8>>;

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ impl<C: Connection> Device<C> {
     }
 
     /// Evaluate a Python expression and return the repr of the result.
+    #[allow(dead_code)]
     pub fn eval(&mut self, expr: &str) -> Result<String> {
         let code = format!("print(repr({}))", expr);
         let result = self.exec(&code)?;
@@ -242,64 +243,81 @@ impl<C: Connection> Device<C> {
     /// Open an interactive REPL — pipes stdin/stdout bidirectionally.
     /// Blocks until the user exits (Ctrl-C / Ctrl-D / "exit()").
     pub fn open_repl(&mut self) -> Result<()> {
-        use std::os::fd::{AsRawFd, BorrowedFd};
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use crossterm::terminal;
 
         // Enter raw REPL without soft reset so we keep running state
         self.session.enter_raw_repl(false)?;
         self.session.exit_raw_repl()?;
 
-        // Now we're in normal REPL. Set up raw terminal for interactive use.
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-
-        // Put terminal in raw mode
-        let orig_termios = set_raw_mode(stdin.as_raw_fd())?;
+        // Set up cross-platform raw terminal
+        terminal::enable_raw_mode().map_err(|e| MpError::Connection(format!("raw mode: {}", e)))?;
 
         let conn = self.session.conn();
+        let mut stdout = io::stdout();
 
-        // REPL loop: read from stdin, write to device; read from device, write to stdout
-        let mut stdout = stdout.lock();
-        let mut stdin_buf = [0u8; 1];
-
-        loop {
-            // Check for data from device
-            match conn.read_all_available() {
-                Ok(data) if !data.is_empty() => {
-                    stdout.write_all(&data).map_err(|e| MpError::Connection(e.to_string()))?;
-                    stdout.flush().map_err(|e| MpError::Connection(e.to_string()))?;
-                }
-                _ => {}
-            }
-
-            // Check for stdin input
-            use nix::poll::{poll, PollFd, PollFlags};
-
-            let stdin_fd = unsafe { BorrowedFd::borrow_raw(stdin.as_raw_fd()) };
-            let mut poll_fds = [PollFd::new(stdin_fd, PollFlags::POLLIN)];
-
-            let poll_result = poll(&mut poll_fds, 0u16).map_err(|e| MpError::Connection(format!("poll error: {}", e)))?;
-            if poll_result > 0 {
-                match io::stdin().read(&mut stdin_buf) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        // Ctrl-D detection
-                        if stdin_buf[0] == 0x04 {
-                            break;
-                        }
-                        conn.write_all(&stdin_buf)?;
+        let result = (|| -> Result<()> {
+            loop {
+                // Read data from device -> write to stdout
+                match conn.read_all_available() {
+                    Ok(data) if !data.is_empty() => {
+                        stdout.write_all(&data).map_err(|e| MpError::Connection(e.to_string()))?;
+                        stdout.flush().map_err(|e| MpError::Connection(e.to_string()))?;
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(MpError::Connection(format!("stdin read error: {}", e))),
+                    _ => {}
                 }
+
+                // Check for stdin key events (non-blocking)
+                if event::poll(Duration::from_millis(0)).map_err(|e| MpError::Connection(format!("poll: {}", e)))? {
+                    if let Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) = event::read().map_err(|e| MpError::Connection(format!("read: {}", e)))? {
+                        match code {
+                            // Ctrl-D exits REPL
+                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => break,
+                            // Ctrl-<char> -> control character (0x01..0x1a)
+                            KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+                                let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                                if (1..=26).contains(&byte) {
+                                    conn.write_all(&[byte])?;
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                conn.write_all(&[c as u8])?;
+                            }
+                            KeyCode::Enter => {
+                                conn.write_all(b"\r")?;
+                            }
+                            KeyCode::Backspace => {
+                                conn.write_all(&[0x08])?;
+                            }
+                            KeyCode::Tab => {
+                                conn.write_all(&[0x09])?;
+                            }
+                            KeyCode::Esc => {
+                                conn.write_all(&[0x1b])?;
+                            }
+                            // Arrow keys -> VT100 escape sequences
+                            KeyCode::Up => conn.write_all(b"\x1b[A")?,
+                            KeyCode::Down => conn.write_all(b"\x1b[B")?,
+                            KeyCode::Right => conn.write_all(b"\x1b[C")?,
+                            KeyCode::Left => conn.write_all(b"\x1b[D")?,
+                            KeyCode::Home => conn.write_all(b"\x1b[H")?,
+                            KeyCode::End => conn.write_all(b"\x1b[F")?,
+                            KeyCode::Delete => conn.write_all(b"\x1b[3~")?,
+                            KeyCode::PageUp => conn.write_all(b"\x1b[5~")?,
+                            KeyCode::PageDown => conn.write_all(b"\x1b[6~")?,
+                            _ => {}
+                        }
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(1));
             }
+            Ok(())
+        })();
 
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        // Restore terminal
-        restore_termios(stdin.as_raw_fd(), orig_termios)?;
-
-        Ok(())
+        // Always restore terminal
+        let _ = terminal::disable_raw_mode();
+        result
     }
 
     /// Soft-reset the device (CTRL-D).
@@ -652,12 +670,10 @@ fn parse_py_list_of_strings(s: &str) -> Result<Vec<String>> {
             } else if !c.is_whitespace() {
                 current.push(c);
             }
+        } else if c == quote_char {
+            in_string = false;
         } else {
-            if c == quote_char {
-                in_string = false;
-            } else {
-                current.push(c);
-            }
+            current.push(c);
         }
     }
 
@@ -674,6 +690,7 @@ fn parse_py_list_of_strings(s: &str) -> Result<Vec<String>> {
 
 /// Generate a Python bytes literal from raw bytes.
 /// Produces valid Python `b'...'` syntax that can be eval'd.
+#[allow(dead_code)]
 fn py_bytes_repr(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len() + 10);
     out.push_str("b'");
@@ -692,52 +709,3 @@ fn py_bytes_repr(data: &[u8]) -> String {
     out
 }
 
-// Terminal raw mode helpers (Unix only)
-
-#[cfg(unix)]
-fn set_raw_mode(raw_fd: std::os::fd::RawFd) -> Result<nix::sys::termios::Termios> {
-    use std::os::fd::BorrowedFd;
-    use nix::sys::termios;
-
-    let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-    let orig = termios::tcgetattr(fd).map_err(|e| MpError::Connection(format!("tcgetattr: {}", e)))?;
-    let mut raw = orig.clone();
-    raw.input_flags.remove(
-        termios::InputFlags::ICRNL | termios::InputFlags::IXON,
-    );
-    raw.local_flags.remove(
-        termios::LocalFlags::ECHO
-            | termios::LocalFlags::ICANON
-            | termios::LocalFlags::ISIG
-            | termios::LocalFlags::IEXTEN,
-    );
-    raw.output_flags.remove(termios::OutputFlags::OPOST);
-    raw.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
-    raw.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-    termios::tcsetattr(fd, termios::SetArg::TCSAFLUSH, &raw)
-        .map_err(|e| MpError::Connection(format!("tcsetattr: {}", e)))?;
-    Ok(orig)
-}
-
-#[cfg(unix)]
-fn restore_termios(raw_fd: std::os::fd::RawFd, orig: nix::sys::termios::Termios) -> Result<()> {
-    use std::os::fd::BorrowedFd;
-    use nix::sys::termios;
-
-    let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
-    termios::tcsetattr(fd, termios::SetArg::TCSAFLUSH, &orig)
-        .map_err(|e| MpError::Connection(format!("tcsetattr restore: {}", e)))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_raw_mode(_raw_fd: std::os::fd::RawFd) -> Result<()> {
-    Err(MpError::Connection(
-        "raw terminal mode not supported on this platform".into(),
-    ))
-}
-
-#[cfg(not(unix))]
-fn restore_termios(_raw_fd: std::os::fd::RawFd, _: ()) -> Result<()> {
-    Ok(())
-}

@@ -52,6 +52,7 @@ pub enum SubmitMode {
     /// Flow-controlled raw-paste (fastest, preferred for serial)
     RawPaste,
     /// Paste mode via CTRL-E (good for WebREPL)
+    #[allow(dead_code)]
     Paste,
     /// Slow 256-byte chunked raw mode (fallback)
     Raw,
@@ -79,6 +80,7 @@ impl<C: Connection> ReplSession<C> {
         &mut self.conn
     }
 
+    #[allow(dead_code)]
     pub fn in_raw_repl(&self) -> bool {
         self.in_raw_repl
     }
