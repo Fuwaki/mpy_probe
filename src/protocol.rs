@@ -146,6 +146,20 @@ impl<C: Connection> ReplSession<C> {
         Ok(())
     }
 
+    /// Send CTRL-C to interrupt the running program.
+    /// Does not enter/exit raw REPL.
+    pub fn send_ctrl_c(&mut self) -> Result<()> {
+        self.conn.write_all(&[CTRL_C, CTRL_C])?;
+        Ok(())
+    }
+
+    /// Send CTRL-D (soft reboot / EOT).
+    /// Must be called while in raw REPL.
+    pub fn send_ctrl_d(&mut self) -> Result<()> {
+        self.conn.write_all(&[CTRL_D])?;
+        Ok(())
+    }
+
     /// Send code bytes. Must be called while already in raw REPL.
     ///
     /// Tries raw-paste first (if enabled), falls back to raw mode.

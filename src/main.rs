@@ -28,6 +28,10 @@ struct Cli {
     #[arg(short, long, default_value = "10")]
     timeout: u64,
 
+    /// Output in JSON format (for IDE integration)
+    #[arg(long)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -83,6 +87,45 @@ enum Command {
         /// Directory path to create
         path: String,
     },
+
+    /// Show device information (version, platform, memory, filesystem)
+    Info,
+
+    /// Soft-reset the device (CTRL-D)
+    Reset,
+
+    /// Interrupt running program (CTRL-C)
+    Interrupt,
+
+    /// Show file/directory status on device
+    Stat {
+        /// Remote file path
+        path: String,
+    },
+
+    /// Upload a directory recursively to the device
+    PutDir {
+        /// Local directory path
+        local: String,
+        /// Remote directory path on device
+        remote: String,
+    },
+
+    /// Download a directory recursively from the device
+    GetDir {
+        /// Remote directory path on device
+        remote: String,
+        /// Local directory path to save to
+        local: String,
+    },
+
+    /// Sync local directory to device (only transfer changed files)
+    Sync {
+        /// Local directory path
+        local: String,
+        /// Remote directory path on device
+        remote: String,
+    },
 }
 
 fn open_device(cli: &Cli) -> Result<Device<SerialConnection>> {
@@ -92,12 +135,28 @@ fn open_device(cli: &Cli) -> Result<Device<SerialConnection>> {
             .context("failed to auto-detect MicroPython device")?,
     };
 
-    eprintln!("Connecting to {} at {} baud...", port_path, cli.baud);
+    if !cli.json {
+        eprintln!("Connecting to {} at {} baud...", port_path, cli.baud);
+    }
     let conn = SerialConnection::open(&port_path, cli.baud)
         .map_err(|e| anyhow::anyhow!(e))?;
     let device = Device::new(conn);
-    eprintln!("Connected.");
+    if !cli.json {
+        eprintln!("Connected.");
+    }
     Ok(device)
+}
+
+fn print_output<T: serde::Serialize>(json: bool, value: &T) {
+    if json {
+        println!("{}", serde_json::to_string(value).unwrap());
+    }
+}
+
+fn print_output_pretty<T: serde::Serialize>(json: bool, value: &T) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value).unwrap());
+    }
 }
 
 fn main() -> Result<()> {
@@ -115,31 +174,43 @@ fn main() -> Result<()> {
 
             let mut device = open_device(&cli)?;
 
-            // Upload the file first, then run it
             let remote_name = Path::new(file)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "__run.py".to_string());
             let remote_path = format!("/flash/{}", remote_name);
 
-            eprintln!("Uploading {} -> {}...", file, remote_path);
+            if !cli.json {
+                eprintln!("Uploading {} -> {}...", file, remote_path);
+            }
             device.write_file(file, &remote_path).map_err(|e| anyhow::anyhow!(e))?;
 
-            eprintln!("Running {}...", remote_path);
+            if !cli.json {
+                eprintln!("Running {}...", remote_path);
+            }
             let result = device.run_file(&remote_path).map_err(|e| anyhow::anyhow!(e))?;
 
-            // Stream output to stdout/stderr
-            if !result.stdout.is_empty() {
-                io::stdout().write_all(&result.stdout)?;
-            }
-            if !result.stderr.is_empty() {
-                io::stderr().write_all(&result.stderr)?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct RunResult { success: bool, stdout: String, stderr: String }
+                let r = RunResult {
+                    success: !result.is_error(),
+                    stdout: result.stdout_str(),
+                    stderr: result.stderr_str(),
+                };
+                println!("{}", serde_json::to_string(&r).unwrap());
+            } else {
+                if !result.stdout.is_empty() {
+                    io::stdout().write_all(&result.stdout)?;
+                }
+                if !result.stderr.is_empty() {
+                    io::stderr().write_all(&result.stderr)?;
+                }
             }
 
-            // Cleanup: remove the uploaded file
             let _ = device.remove(&remote_path);
 
-            if result.is_error() {
+            if result.is_error() && !cli.json {
                 std::process::exit(1);
             }
         }
@@ -149,47 +220,194 @@ fn main() -> Result<()> {
             }
 
             let mut device = open_device(&cli)?;
-            eprintln!("Uploading {} -> {}...", local, remote);
+            if !cli.json {
+                eprintln!("Uploading {} -> {}...", local, remote);
+            }
             device.write_file(local, remote).map_err(|e| anyhow::anyhow!(e))?;
-            eprintln!("Done.");
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, local: String, remote: String }
+                print_output(true, &R { success: true, local: local.clone(), remote: remote.clone() });
+            } else {
+                eprintln!("Done.");
+            }
         }
         Command::Get { remote, local } => {
             let mut device = open_device(&cli)?;
-            eprintln!("Downloading {} -> {}...", remote, local);
+            if !cli.json {
+                eprintln!("Downloading {} -> {}...", remote, local);
+            }
             device.get_file(remote, local).map_err(|e| anyhow::anyhow!(e))?;
-            eprintln!("Done.");
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, remote: String, local: String }
+                print_output(true, &R { success: true, remote: remote.clone(), local: local.clone() });
+            } else {
+                eprintln!("Done.");
+            }
         }
         Command::Exec { code } => {
             let mut device = open_device(&cli)?;
             let result = device.exec(code).map_err(|e| anyhow::anyhow!(e))?;
 
-            if !result.stdout.is_empty() {
-                io::stdout().write_all(&result.stdout)?;
-            }
-            if !result.stderr.is_empty() {
-                io::stderr().write_all(&result.stderr)?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, stdout: String, stderr: String }
+                print_output(true, &R {
+                    success: !result.is_error(),
+                    stdout: result.stdout_str(),
+                    stderr: result.stderr_str(),
+                });
+            } else {
+                if !result.stdout.is_empty() {
+                    io::stdout().write_all(&result.stdout)?;
+                }
+                if !result.stderr.is_empty() {
+                    io::stderr().write_all(&result.stderr)?;
+                }
             }
 
-            if result.is_error() {
+            if result.is_error() && !cli.json {
                 std::process::exit(1);
             }
         }
         Command::Ls { path } => {
             let mut device = open_device(&cli)?;
             let entries = device.list_dir(path).map_err(|e| anyhow::anyhow!(e))?;
-            for entry in &entries {
-                println!("{}", entry);
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { path: String, entries: Vec<String> }
+                print_output(true, &R { path: path.clone(), entries });
+            } else {
+                for entry in &entries {
+                    println!("{}", entry);
+                }
             }
         }
         Command::Rm { path } => {
             let mut device = open_device(&cli)?;
             device.remove(path).map_err(|e| anyhow::anyhow!(e))?;
-            eprintln!("Removed: {}", path);
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, path: String }
+                print_output(true, &R { success: true, path: path.clone() });
+            } else {
+                eprintln!("Removed: {}", path);
+            }
         }
         Command::Mkdir { path } => {
             let mut device = open_device(&cli)?;
             device.mkdir(path).map_err(|e| anyhow::anyhow!(e))?;
-            eprintln!("Created: {}", path);
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, path: String }
+                print_output(true, &R { success: true, path: path.clone() });
+            } else {
+                eprintln!("Created: {}", path);
+            }
+        }
+        Command::Info => {
+            let mut device = open_device(&cli)?;
+            let info = device.device_info().map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                print_output_pretty(true, &info);
+            } else {
+                println!("version:  {}", info.version);
+                println!("platform: {}", info.platform);
+                println!("machine:  {}", info.machine);
+                if let Some(mem) = info.mem_free {
+                    println!("mem_free: {} bytes ({:.1} KB)", mem, mem as f64 / 1024.0);
+                }
+                if let Some(total) = info.fs_total {
+                    println!("fs_total: {} bytes ({:.1} KB)", total, total as f64 / 1024.0);
+                }
+                if let Some(free) = info.fs_free {
+                    println!("fs_free:  {} bytes ({:.1} KB)", free, free as f64 / 1024.0);
+                }
+            }
+        }
+        Command::Reset => {
+            let mut device = open_device(&cli)?;
+            device.soft_reset().map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool }
+                print_output(true, &R { success: true });
+            } else {
+                eprintln!("Device reset.");
+            }
+        }
+        Command::Interrupt => {
+            let mut device = open_device(&cli)?;
+            device.interrupt().map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool }
+                print_output(true, &R { success: true });
+            } else {
+                eprintln!("Interrupt sent.");
+            }
+        }
+        Command::Stat { path } => {
+            let mut device = open_device(&cli)?;
+            let stat = device.stat(path).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                print_output_pretty(true, &stat);
+            } else {
+                println!("path:  {}", stat.path);
+                println!("type:  {}", if stat.is_dir { "directory" } else { "file" });
+                println!("size:  {} bytes", stat.size);
+                if let Some(mtime) = stat.mtime {
+                    println!("mtime: {}", mtime);
+                }
+            }
+        }
+        Command::PutDir { local, remote } => {
+            let local_path = Path::new(local);
+            if !local_path.exists() || !local_path.is_dir() {
+                return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
+            }
+            let mut device = open_device(&cli)?;
+            let count = device.put_dir(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, local: String, remote: String, count: usize }
+                print_output(true, &R { success: true, local: local.clone(), remote: remote.clone(), count });
+            } else {
+                eprintln!("Uploaded {} files.", count);
+            }
+        }
+        Command::GetDir { remote, local } => {
+            let mut device = open_device(&cli)?;
+            let count = device.get_dir(remote, local).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, remote: String, local: String, count: usize }
+                print_output(true, &R { success: true, remote: remote.clone(), local: local.clone(), count });
+            } else {
+                eprintln!("Downloaded {} files.", count);
+            }
+        }
+        Command::Sync { local, remote } => {
+            let local_path = Path::new(local);
+            if !local_path.exists() || !local_path.is_dir() {
+                return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
+            }
+            let mut device = open_device(&cli)?;
+            let stats = device.sync(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, uploaded: usize, downloaded: usize, deleted: usize }
+                print_output(true, &R {
+                    success: true,
+                    uploaded: stats.uploaded,
+                    downloaded: stats.downloaded,
+                    deleted: stats.deleted,
+                });
+            } else {
+                eprintln!("Sync complete: {} uploaded, {} downloaded, {} deleted",
+                    stats.uploaded, stats.downloaded, stats.deleted);
+            }
         }
     }
 

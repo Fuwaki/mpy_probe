@@ -1,9 +1,39 @@
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::connection::Connection;
 use crate::error::{MpError, Result};
 use crate::protocol::{ExecResult, ReplSession};
+
+/// Device information returned by `device_info()`.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct DeviceInfo {
+    pub version: String,
+    pub platform: String,
+    pub machine: String,
+    pub mem_free: Option<u64>,
+    pub fs_total: Option<u64>,
+    pub fs_free: Option<u64>,
+}
+
+/// File/directory status on the device.
+#[derive(Debug, serde::Serialize)]
+pub struct FileStat {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: Option<u64>,
+}
+
+/// Result of a sync operation.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct SyncStats {
+    pub uploaded: usize,
+    pub downloaded: usize,
+    pub deleted: usize,
+}
 
 /// High-level device operations built on top of the REPL session.
 pub struct Device<C: Connection> {
@@ -272,10 +302,273 @@ impl<C: Connection> Device<C> {
         Ok(())
     }
 
-    /// Soft-reset the device.
+    /// Soft-reset the device (CTRL-D).
     pub fn soft_reset(&mut self) -> Result<()> {
-        self.exec("import machine; machine.reset()")?;
+        self.session.enter_raw_repl(false)?;
+        self.session.send_ctrl_d()?;
+        self.session.exit_raw_repl()?;
         Ok(())
+    }
+
+    /// Get device information: version, platform, board, memory, filesystem.
+    pub fn device_info(&mut self) -> Result<DeviceInfo> {
+        let code = "import sys, os, gc\ngc.collect()\nprint('version:' + sys.version)\nprint('platform:' + sys.platform)\ntry:\n m=str(sys.implementation._machine)\nexcept:\n m=str(sys.implementation)\nprint('machine:' + m)\nprint('mem_free:' + str(gc.mem_free()))\ntry:\n s=os.statvfs('/flash')\n print('fs_total:' + str(s[0]*s[2]))\n print('fs_free:' + str(s[0]*s[4]))\nexcept:\n try:\n  s=os.statvfs('/')\n  print('fs_total:' + str(s[0]*s[2]))\n  print('fs_free:' + str(s[0]*s[4]))\n except:\n  pass\n";
+        let result = self.exec(code)?;
+        if result.is_error() {
+            return Err(MpError::Execution {
+                stdout: result.stdout_str(),
+                stderr: result.stderr_str(),
+            });
+        }
+
+        let mut info = DeviceInfo::default();
+        for line in result.stdout_str().lines() {
+            let line = line.trim();
+            if let Some((key, val)) = line.split_once(':') {
+                match key {
+                    "version" => info.version = val.to_string(),
+                    "platform" => info.platform = val.to_string(),
+                    "machine" => info.machine = val.to_string(),
+                    "mem_free" => info.mem_free = val.parse().ok(),
+                    "fs_total" => info.fs_total = val.parse().ok(),
+                    "fs_free" => info.fs_free = val.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(info)
+    }
+
+    /// Send interrupt (CTRL-C) to the device without entering raw REPL.
+    pub fn interrupt(&mut self) -> Result<()> {
+        self.session.send_ctrl_c()
+    }
+
+    /// Get file/directory status on the device.
+    pub fn stat(&mut self, path: &str) -> Result<FileStat> {
+        let escaped = path.replace('\'', "\\'");
+        let code = format!(
+            "import os\n\
+             s=os.stat('{}')\n\
+             print('mode:' + str(s[0]))\n\
+             print('size:' + str(s[6]))\n\
+             print('mtime:' + str(s[8]))",
+            escaped
+        );
+        let result = self.exec(&code)?;
+        if result.is_error() {
+            return Err(MpError::Execution {
+                stdout: result.stdout_str(),
+                stderr: result.stderr_str(),
+            });
+        }
+
+        let mut mode: u32 = 0;
+        let mut size: u64 = 0;
+        let mut mtime: Option<u64> = None;
+
+        for line in result.stdout_str().lines() {
+            let line = line.trim();
+            if let Some((key, val)) = line.split_once(':') {
+                match key {
+                    "mode" => mode = val.parse().unwrap_or(0),
+                    "size" => size = val.parse().unwrap_or(0),
+                    "mtime" => {
+                        let v: u64 = val.parse().unwrap_or(0);
+                        if v > 0 {
+                            mtime = Some(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(FileStat {
+            path: path.to_string(),
+            is_dir: (mode & 0o170000) == 0o040000,
+            size,
+            mtime,
+        })
+    }
+
+    /// Upload a local directory recursively to the device.
+    /// Returns the number of files uploaded.
+    pub fn put_dir(&mut self, local_dir: &str, remote_dir: &str) -> Result<usize> {
+        let local_path = Path::new(local_dir);
+        let mut count = 0;
+
+        // Ensure remote directory exists
+        let _ = self.mkdir(remote_dir);
+
+        for entry in fs::read_dir(local_path).map_err(|e| {
+            MpError::Filesystem(format!("failed to read {}: {}", local_dir, e))
+        })? {
+            let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let local_file = entry.path();
+            let remote_file = format!(
+                "{}/{}",
+                remote_dir.trim_end_matches('/'),
+                file_name
+            );
+
+            if local_file.is_dir() {
+                count += self.put_dir(&local_file.to_string_lossy(), &remote_file)?;
+            } else {
+                self.write_file(&local_file.to_string_lossy(), &remote_file)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Download a remote directory recursively from the device.
+    /// Returns the number of files downloaded.
+    pub fn get_dir(&mut self, remote_dir: &str, local_dir: &str) -> Result<usize> {
+        let local_path = Path::new(local_dir);
+        fs::create_dir_all(local_path).map_err(|e| {
+            MpError::Filesystem(format!("failed to create {}: {}", local_dir, e))
+        })?;
+
+        let entries = self.list_dir(remote_dir)?;
+        let mut count = 0;
+
+        for name in &entries {
+            let remote_path = format!(
+                "{}/{}",
+                remote_dir.trim_end_matches('/'),
+                name
+            );
+            let local_file = local_path.join(name);
+
+            match self.stat(&remote_path) {
+                Ok(s) if s.is_dir => {
+                    count += self.get_dir(&remote_path, &local_file.to_string_lossy())?;
+                }
+                _ => {
+                    self.get_file(&remote_path, &local_file.to_string_lossy())?;
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Sync local directory to device. Uploads new/changed files, deletes
+    /// remote files that don't exist locally.
+    pub fn sync(&mut self, local_dir: &str, remote_dir: &str) -> Result<SyncStats> {
+        let mut stats = SyncStats::default();
+        let local_path = Path::new(local_dir);
+
+        // Build set of local files
+        let local_files = self.collect_local_files(local_path, "")?;
+
+        // Build set of remote files
+        let remote_files = self.collect_remote_files(remote_dir)?;
+
+        // Upload new/changed files
+        for (rel_path, local_file) in &local_files {
+            let remote_path = format!(
+                "{}/{}",
+                remote_dir.trim_end_matches('/'),
+                rel_path
+            );
+
+            let needs_upload = match remote_files.get(rel_path) {
+                None => true,
+                Some(remote_stat) => {
+                    let local_meta = fs::metadata(local_file).map_err(|e| {
+                        MpError::Filesystem(e.to_string())
+                    })?;
+                    local_meta.len() != remote_stat.size
+                }
+            };
+
+            if needs_upload {
+                // Ensure parent directory exists
+                if let Some(parent) = Path::new(&remote_path).parent() {
+                    let _ = self.mkdir(&parent.to_string_lossy());
+                }
+                self.write_file(local_file, &remote_path)?;
+                stats.uploaded += 1;
+            }
+        }
+
+        // Delete remote files not present locally
+        for rel_path in remote_files.keys() {
+            if !local_files.contains_key(rel_path) {
+                let remote_path = format!(
+                    "{}/{}",
+                    remote_dir.trim_end_matches('/'),
+                    rel_path
+                );
+                let _ = self.remove(&remote_path);
+                stats.deleted += 1;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Recursively collect local files as (relative_path, absolute_path).
+    fn collect_local_files(&self, base: &Path, rel: &str) -> Result<std::collections::HashMap<String, String>> {
+        let mut map = std::collections::HashMap::new();
+        let dir = if rel.is_empty() { base.to_path_buf() } else { base.join(rel) };
+
+        for entry in fs::read_dir(&dir).map_err(|e| {
+            MpError::Filesystem(format!("failed to read {}: {}", dir.display(), e))
+        })? {
+            let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel_path = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", rel, name)
+            };
+
+            if entry.path().is_dir() {
+                map.extend(self.collect_local_files(base, &rel_path)?);
+            } else {
+                map.insert(rel_path, entry.path().to_string_lossy().to_string());
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Recursively collect remote files as (relative_path, FileStat).
+    fn collect_remote_files(&mut self, remote_dir: &str) -> Result<std::collections::HashMap<String, FileStat>> {
+        let mut map = std::collections::HashMap::new();
+        let entries = match self.list_dir(remote_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(map),
+        };
+
+        for name in &entries {
+            let remote_path = format!(
+                "{}/{}",
+                remote_dir.trim_end_matches('/'),
+                name
+            );
+            match self.stat(&remote_path) {
+                Ok(s) if s.is_dir => {
+                    map.extend(self.collect_remote_files(&remote_path)?);
+                }
+                Ok(s) => {
+                    let rel = remote_path.strip_prefix(&format!("{}/", remote_dir.trim_end_matches('/')))
+                        .unwrap_or(name)
+                        .to_string();
+                    map.insert(rel, s);
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(map)
     }
 }
 
