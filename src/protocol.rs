@@ -261,13 +261,22 @@ impl<C: Connection> ReplSession<C> {
         // Signal end of data
         self.conn.write_all(&[CTRL_D])?;
 
-        // Wait for device acknowledgment (single CTRL-D)
-        let ack = self.conn.read_exact(1, DEFAULT_TIMEOUT)?;
-        if ack[0] != CTRL_D {
-            return Err(MpError::Protocol(format!(
-                "expected CTRL-D ack after raw-paste, got 0x{:02x}",
-                ack[0]
-            )));
+        // Wait for device acknowledgment (single CTRL-D).
+        // The device may have sent CTRL-A (window refill) while we were
+        // sending the last batch of data. Drain any stale CTRL-A bytes
+        // before expecting the CTRL-D ack.
+        loop {
+            let ack = self.conn.read_exact(1, DEFAULT_TIMEOUT)?;
+            match ack[0] {
+                CTRL_D => break,
+                CTRL_A => continue, // stale flow control, ignore
+                other => {
+                    return Err(MpError::Protocol(format!(
+                        "expected CTRL-D ack after raw-paste, got 0x{:02x}",
+                        other
+                    )));
+                }
+            }
         }
 
         Ok(())
