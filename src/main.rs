@@ -125,6 +125,17 @@ enum Command {
         local: String,
         /// Remote directory path on device
         remote: String,
+        /// Show what would be synced without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Compare local and remote directories, show differences
+    Diff {
+        /// Local directory path
+        local: String,
+        /// Remote directory path on device
+        remote: String,
     },
 }
 
@@ -388,25 +399,56 @@ fn main() -> Result<()> {
                 eprintln!("Downloaded {} files.", count);
             }
         }
-        Command::Sync { local, remote } => {
+        Command::Sync { local, remote, dry_run } => {
             let local_path = Path::new(local);
             if !local_path.exists() || !local_path.is_dir() {
                 return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
             }
             let mut device = open_device(&cli)?;
-            let stats = device.sync(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            let stats = device.sync(local, remote, *dry_run).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
-                struct R { success: bool, uploaded: usize, downloaded: usize, deleted: usize }
+                struct R { success: bool, dry_run: bool, uploaded: usize, downloaded: usize, deleted: usize }
                 print_output(true, &R {
                     success: true,
+                    dry_run: *dry_run,
                     uploaded: stats.uploaded,
                     downloaded: stats.downloaded,
                     deleted: stats.deleted,
                 });
+            } else if *dry_run {
+                eprintln!("Dry run — {} would upload, {} would delete",
+                    stats.uploaded, stats.deleted);
             } else {
                 eprintln!("Sync complete: {} uploaded, {} downloaded, {} deleted",
                     stats.uploaded, stats.downloaded, stats.deleted);
+            }
+        }
+        Command::Diff { local, remote } => {
+            let local_path = Path::new(local);
+            if !local_path.exists() || !local_path.is_dir() {
+                return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
+            }
+            let mut device = open_device(&cli)?;
+            let diff = device.diff(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                print_output_pretty(true, &diff);
+            } else if diff.entries.is_empty() {
+                eprintln!("No differences — local and remote are in sync.");
+            } else {
+                for entry in &diff.entries {
+                    match entry.status.as_str() {
+                        "new" => println!("+ {} (local: {} bytes)",
+                            entry.path, entry.local_size.unwrap_or(0)),
+                        "changed" => println!("~ {} (local: {} → remote: {} bytes)",
+                            entry.path, entry.local_size.unwrap_or(0), entry.remote_size.unwrap_or(0)),
+                        "deleted" => println!("- {} (remote: {} bytes)",
+                            entry.path, entry.remote_size.unwrap_or(0)),
+                        _ => {}
+                    }
+                }
+                eprintln!("\n{} new, {} changed, {} deleted",
+                    diff.new_count, diff.changed_count, diff.deleted_count);
             }
         }
     }

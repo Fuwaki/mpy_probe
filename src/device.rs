@@ -35,6 +35,24 @@ pub struct SyncStats {
     pub deleted: usize,
 }
 
+/// A single file difference between local and remote.
+#[derive(Debug, serde::Serialize)]
+pub struct DiffEntry {
+    pub path: String,
+    pub status: String,  // "new", "changed", "deleted"
+    pub local_size: Option<u64>,
+    pub remote_size: Option<u64>,
+}
+
+/// Result of a diff operation.
+#[derive(Debug, serde::Serialize)]
+pub struct DiffResult {
+    pub entries: Vec<DiffEntry>,
+    pub new_count: usize,
+    pub changed_count: usize,
+    pub deleted_count: usize,
+}
+
 /// High-level device operations built on top of the REPL session.
 pub struct Device<C: Connection> {
     session: ReplSession<C>,
@@ -477,8 +495,9 @@ impl<C: Connection> Device<C> {
     }
 
     /// Sync local directory to device. Uploads new/changed files, deletes
-    /// remote files that don't exist locally.
-    pub fn sync(&mut self, local_dir: &str, remote_dir: &str) -> Result<SyncStats> {
+    /// remote files that don't exist locally. If dry_run is true, only report
+    /// what would be done without making changes.
+    pub fn sync(&mut self, local_dir: &str, remote_dir: &str, dry_run: bool) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
         let local_path = Path::new(local_dir);
 
@@ -507,11 +526,13 @@ impl<C: Connection> Device<C> {
             };
 
             if needs_upload {
-                // Ensure parent directory exists
-                if let Some(parent) = Path::new(&remote_path).parent() {
-                    let _ = self.mkdir(&parent.to_string_lossy());
+                if !dry_run {
+                    // Ensure parent directory exists
+                    if let Some(parent) = Path::new(&remote_path).parent() {
+                        let _ = self.mkdir(&parent.to_string_lossy());
+                    }
+                    self.write_file(local_file, &remote_path)?;
                 }
-                self.write_file(local_file, &remote_path)?;
                 stats.uploaded += 1;
             }
         }
@@ -519,17 +540,85 @@ impl<C: Connection> Device<C> {
         // Delete remote files not present locally
         for rel_path in remote_files.keys() {
             if !local_files.contains_key(rel_path) {
-                let remote_path = format!(
-                    "{}/{}",
-                    remote_dir.trim_end_matches('/'),
-                    rel_path
-                );
-                let _ = self.remove(&remote_path);
+                if !dry_run {
+                    let remote_path = format!(
+                        "{}/{}",
+                        remote_dir.trim_end_matches('/'),
+                        rel_path
+                    );
+                    let _ = self.remove(&remote_path);
+                }
                 stats.deleted += 1;
             }
         }
 
         Ok(stats)
+    }
+
+    /// Compare local and remote directories, returning a list of differences.
+    pub fn diff(&mut self, local_dir: &str, remote_dir: &str) -> Result<DiffResult> {
+        let local_path = Path::new(local_dir);
+        let local_files = self.collect_local_files(local_path, "")?;
+        let remote_files = self.collect_remote_files(remote_dir)?;
+
+        let mut entries = Vec::new();
+        let mut new_count = 0;
+        let mut changed_count = 0;
+        let mut deleted_count = 0;
+
+        // Check local files against remote
+        for (rel_path, local_file) in &local_files {
+            let local_meta = fs::metadata(local_file).map_err(|e| {
+                MpError::Filesystem(e.to_string())
+            })?;
+            let local_size = local_meta.len();
+
+            match remote_files.get(rel_path) {
+                None => {
+                    entries.push(DiffEntry {
+                        path: rel_path.clone(),
+                        status: "new".to_string(),
+                        local_size: Some(local_size),
+                        remote_size: None,
+                    });
+                    new_count += 1;
+                }
+                Some(remote_stat) => {
+                    if local_size != remote_stat.size {
+                        entries.push(DiffEntry {
+                            path: rel_path.clone(),
+                            status: "changed".to_string(),
+                            local_size: Some(local_size),
+                            remote_size: Some(remote_stat.size),
+                        });
+                        changed_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Check for remote-only files (deleted locally)
+        for (rel_path, remote_stat) in &remote_files {
+            if !local_files.contains_key(rel_path) {
+                entries.push(DiffEntry {
+                    path: rel_path.clone(),
+                    status: "deleted".to_string(),
+                    local_size: None,
+                    remote_size: Some(remote_stat.size),
+                });
+                deleted_count += 1;
+            }
+        }
+
+        // Sort by path for consistent output
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(DiffResult {
+            entries,
+            new_count,
+            changed_count,
+            deleted_count,
+        })
     }
 
     /// Recursively collect local files as (relative_path, absolute_path).
