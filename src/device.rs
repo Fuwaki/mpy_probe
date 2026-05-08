@@ -223,6 +223,12 @@ impl<C: Connection> Device<C> {
         Ok(())
     }
 
+    /// Read a text file and return its content as a string.
+    pub fn cat(&mut self, remote_path: &str) -> Result<String> {
+        let data = self.read_file(remote_path)?;
+        Ok(String::from_utf8_lossy(&data).to_string())
+    }
+
     /// List files in a directory on the device.
     pub fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
         let code = format!("import os; print(repr(os.listdir('{}')))", path.replace('\'', "\\'"));
@@ -242,9 +248,13 @@ impl<C: Connection> Device<C> {
         let code = format!("import os; os.remove('{}')", path.replace('\'', "\\'"));
         let result = self.exec(&code)?;
         if result.is_error() {
+            let stderr = result.stderr_str();
+            if stderr.contains("ENOENT") || stderr.contains("Errno 2") {
+                return Err(MpError::Filesystem(format!("not found: {}", path)));
+            }
             return Err(MpError::Execution {
                 stdout: result.stdout_str(),
-                stderr: result.stderr_str(),
+                stderr,
             });
         }
         Ok(())
@@ -252,7 +262,11 @@ impl<C: Connection> Device<C> {
 
     /// Create a directory on the device.
     pub fn mkdir(&mut self, path: &str) -> Result<()> {
-        let code = format!("import os; os.mkdir('{}')", path.replace('\'', "\\'"));
+        // Create directory and all parents, ignore if already exists.
+        let code = format!(
+            "import os\np='{}'\nfor i in range(1,len(p.split('/'))+1):\n d='/'.join(p.split('/')[:i]) or '/'\n try: os.mkdir(d)\n except: pass",
+            path.replace('\'', "\\'")
+        );
         let result = self.exec(&code)?;
         if result.is_error() {
             return Err(MpError::Execution {
@@ -516,7 +530,7 @@ impl<C: Connection> Device<C> {
         let local_files = self.collect_local_files(local_path, "", excludes)?;
 
         // Build set of remote files
-        let remote_files = self.collect_remote_files(remote_dir)?;
+        let remote_files = self.collect_remote_files(remote_dir, excludes)?;
 
         // Upload new/changed files
         for (rel_path, local_file) in &local_files {
@@ -611,7 +625,7 @@ impl<C: Connection> Device<C> {
 
         // Directory diff
         let local_files = self.collect_local_files(local, "", excludes)?;
-        let remote_files = self.collect_remote_files(remote_path)?;
+        let remote_files = self.collect_remote_files(remote_path, excludes)?;
 
         let mut entries = Vec::new();
         let mut new_count = 0;
@@ -706,7 +720,11 @@ impl<C: Connection> Device<C> {
     }
 
     /// Recursively collect remote files as (relative_path, FileStat).
-    fn collect_remote_files(&mut self, remote_dir: &str) -> Result<std::collections::HashMap<String, FileStat>> {
+    fn collect_remote_files(&mut self, remote_dir: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, FileStat>> {
+        self.collect_remote_files_inner(remote_dir, remote_dir, excludes)
+    }
+
+    fn collect_remote_files_inner(&mut self, root_dir: &str, remote_dir: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, FileStat>> {
         let mut map = std::collections::HashMap::new();
         let entries = match self.list_dir(remote_dir) {
             Ok(e) => e,
@@ -714,6 +732,9 @@ impl<C: Connection> Device<C> {
         };
 
         for name in &entries {
+            if excludes.contains(&name.as_str()) {
+                continue;
+            }
             let remote_path = format!(
                 "{}/{}",
                 remote_dir.trim_end_matches('/'),
@@ -721,10 +742,10 @@ impl<C: Connection> Device<C> {
             );
             match self.stat(&remote_path) {
                 Ok(s) if s.is_dir => {
-                    map.extend(self.collect_remote_files(&remote_path)?);
+                    map.extend(self.collect_remote_files_inner(root_dir, &remote_path, excludes)?);
                 }
                 Ok(s) => {
-                    let rel = remote_path.strip_prefix(&format!("{}/", remote_dir.trim_end_matches('/')))
+                    let rel = remote_path.strip_prefix(&format!("{}/", root_dir.trim_end_matches('/')))
                         .unwrap_or(name)
                         .to_string();
                     map.insert(rel, s);

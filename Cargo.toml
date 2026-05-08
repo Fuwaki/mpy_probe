@@ -3,6 +3,10 @@ name = "mpy_probe"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "mpy_probe"
+path = "src/main.rs"
+
 [dependencies]
 serialport = "4"
 clap = { version = "4", features = ["derive"] }

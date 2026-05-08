@@ -97,6 +97,12 @@ enum Command {
         path: String,
     },
 
+    /// Display file contents on the device
+    Cat {
+        /// Remote file path
+        path: String,
+    },
+
     /// Show device information (version, platform, memory, filesystem)
     Info,
 
@@ -333,6 +339,17 @@ fn main() -> Result<()> {
                 print_output(true, &R { success: true, path: path.clone() });
             } else {
                 eprintln!("Created: {}", path);
+            }
+        }
+        Command::Cat { path } => {
+            let mut device = open_device(&cli)?;
+            let content = device.cat(path).map_err(|e| anyhow::anyhow!(e))?;
+            if cli.json {
+                #[derive(serde::Serialize)]
+                struct R { success: bool, path: String, content: String }
+                print_output(true, &R { success: true, path: path.clone(), content });
+            } else {
+                print!("{}", content);
             }
         }
         Command::Info => {
