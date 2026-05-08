@@ -7,6 +7,11 @@ use crate::connection::Connection;
 use crate::error::{MpError, Result};
 use crate::protocol::{ExecResult, ReplSession};
 
+/// Default directory names to exclude from local file collection.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    ".git", "__pycache__", ".DS_Store", "node_modules", ".vscode", ".idea",
+];
+
 /// Device information returned by `device_info()`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct DeviceInfo {
@@ -431,7 +436,7 @@ impl<C: Connection> Device<C> {
 
     /// Upload a local directory recursively to the device.
     /// Returns the number of files uploaded.
-    pub fn put_dir(&mut self, local_dir: &str, remote_dir: &str) -> Result<usize> {
+    pub fn put_dir(&mut self, local_dir: &str, remote_dir: &str, excludes: &[&str]) -> Result<usize> {
         let local_path = Path::new(local_dir);
         let mut count = 0;
 
@@ -443,6 +448,12 @@ impl<C: Connection> Device<C> {
         })? {
             let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
             let file_name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip excluded directory/file names
+            if excludes.contains(&file_name.as_str()) {
+                continue;
+            }
+
             let local_file = entry.path();
             let remote_file = format!(
                 "{}/{}",
@@ -451,7 +462,7 @@ impl<C: Connection> Device<C> {
             );
 
             if local_file.is_dir() {
-                count += self.put_dir(&local_file.to_string_lossy(), &remote_file)?;
+                count += self.put_dir(&local_file.to_string_lossy(), &remote_file, excludes)?;
             } else {
                 self.write_file(&local_file.to_string_lossy(), &remote_file)?;
                 count += 1;
@@ -497,12 +508,12 @@ impl<C: Connection> Device<C> {
     /// Sync local directory to device. Uploads new/changed files, deletes
     /// remote files that don't exist locally. If dry_run is true, only report
     /// what would be done without making changes.
-    pub fn sync(&mut self, local_dir: &str, remote_dir: &str, dry_run: bool) -> Result<SyncStats> {
+    pub fn sync(&mut self, local_dir: &str, remote_dir: &str, dry_run: bool, excludes: &[&str]) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
         let local_path = Path::new(local_dir);
 
         // Build set of local files
-        let local_files = self.collect_local_files(local_path, "")?;
+        let local_files = self.collect_local_files(local_path, "", excludes)?;
 
         // Build set of remote files
         let remote_files = self.collect_remote_files(remote_dir)?;
@@ -555,11 +566,52 @@ impl<C: Connection> Device<C> {
         Ok(stats)
     }
 
-    /// Compare local and remote directories, returning a list of differences.
-    pub fn diff(&mut self, local_dir: &str, remote_dir: &str) -> Result<DiffResult> {
-        let local_path = Path::new(local_dir);
-        let local_files = self.collect_local_files(local_path, "")?;
-        let remote_files = self.collect_remote_files(remote_dir)?;
+    /// Compare local and remote, returning a list of differences.
+    /// Supports both single files and directories.
+    pub fn diff(&mut self, local_path: &str, remote_path: &str, excludes: &[&str]) -> Result<DiffResult> {
+        let local = Path::new(local_path);
+
+        // Single file diff
+        if local.is_file() {
+            let file_name = local.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let remote_file = format!("{}/{}", remote_path.trim_end_matches('/'), file_name);
+
+            let local_meta = fs::metadata(local).map_err(|e| {
+                MpError::Filesystem(e.to_string())
+            })?;
+            let local_size = local_meta.len();
+
+            let mut entries = Vec::new();
+            match self.stat(&remote_file) {
+                Ok(remote_stat) => {
+                    if local_size != remote_stat.size {
+                        entries.push(DiffEntry {
+                            path: file_name,
+                            status: "changed".to_string(),
+                            local_size: Some(local_size),
+                            remote_size: Some(remote_stat.size),
+                        });
+                        return Ok(DiffResult { entries, new_count: 0, changed_count: 1, deleted_count: 0 });
+                    }
+                }
+                Err(_) => {
+                    entries.push(DiffEntry {
+                        path: file_name,
+                        status: "new".to_string(),
+                        local_size: Some(local_size),
+                        remote_size: None,
+                    });
+                    return Ok(DiffResult { entries, new_count: 1, changed_count: 0, deleted_count: 0 });
+                }
+            }
+            return Ok(DiffResult { entries, new_count: 0, changed_count: 0, deleted_count: 0 });
+        }
+
+        // Directory diff
+        let local_files = self.collect_local_files(local, "", excludes)?;
+        let remote_files = self.collect_remote_files(remote_path)?;
 
         let mut entries = Vec::new();
         let mut new_count = 0;
@@ -622,7 +674,7 @@ impl<C: Connection> Device<C> {
     }
 
     /// Recursively collect local files as (relative_path, absolute_path).
-    fn collect_local_files(&self, base: &Path, rel: &str) -> Result<std::collections::HashMap<String, String>> {
+    fn collect_local_files(&self, base: &Path, rel: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, String>> {
         let mut map = std::collections::HashMap::new();
         let dir = if rel.is_empty() { base.to_path_buf() } else { base.join(rel) };
 
@@ -631,6 +683,12 @@ impl<C: Connection> Device<C> {
         })? {
             let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip excluded directory/file names
+            if excludes.contains(&name.as_str()) {
+                continue;
+            }
+
             let rel_path = if rel.is_empty() {
                 name.clone()
             } else {
@@ -638,7 +696,7 @@ impl<C: Connection> Device<C> {
             };
 
             if entry.path().is_dir() {
-                map.extend(self.collect_local_files(base, &rel_path)?);
+                map.extend(self.collect_local_files(base, &rel_path, excludes)?);
             } else {
                 map.insert(rel_path, entry.path().to_string_lossy().to_string());
             }

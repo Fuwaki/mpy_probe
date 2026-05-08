@@ -10,8 +10,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use connection::SerialConnection;
-use device::Device;
+use device::{Device, DEFAULT_EXCLUDES};
 use error::MpError;
+
+/// Build the full excludes list: default excludes + user-provided extras.
+fn build_excludes(user_excludes: &[String]) -> Vec<&str> {
+    let mut excludes: Vec<&str> = DEFAULT_EXCLUDES.to_vec();
+    for e in user_excludes {
+        excludes.push(e.as_str());
+    }
+    excludes
+}
 
 #[derive(Parser)]
 #[command(name = "mpy_probe", version, about = "MicroPython board interaction tool")]
@@ -109,6 +118,9 @@ enum Command {
         local: String,
         /// Remote directory path on device
         remote: String,
+        /// Extra directory names to exclude (in addition to defaults: .git, __pycache__, etc.)
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 
     /// Download a directory recursively from the device
@@ -128,14 +140,20 @@ enum Command {
         /// Show what would be synced without making changes
         #[arg(long)]
         dry_run: bool,
+        /// Extra directory names to exclude (in addition to defaults: .git, __pycache__, etc.)
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 
-    /// Compare local and remote directories, show differences
+    /// Compare local and remote, show differences (supports single file or directory)
     Diff {
-        /// Local directory path
+        /// Local file or directory path
         local: String,
-        /// Remote directory path on device
+        /// Remote file or directory path on device
         remote: String,
+        /// Extra directory names to exclude (in addition to defaults: .git, __pycache__, etc.)
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 }
 
@@ -373,13 +391,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::PutDir { local, remote } => {
+        Command::PutDir { local, remote, exclude } => {
             let local_path = Path::new(local);
             if !local_path.exists() || !local_path.is_dir() {
                 return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
             }
+            let excludes = build_excludes(exclude);
             let mut device = open_device(&cli)?;
-            let count = device.put_dir(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            let count = device.put_dir(local, remote, &excludes).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
                 struct R { success: bool, local: String, remote: String, count: usize }
@@ -399,13 +418,14 @@ fn main() -> Result<()> {
                 eprintln!("Downloaded {} files.", count);
             }
         }
-        Command::Sync { local, remote, dry_run } => {
+        Command::Sync { local, remote, dry_run, exclude } => {
             let local_path = Path::new(local);
             if !local_path.exists() || !local_path.is_dir() {
                 return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
             }
+            let excludes = build_excludes(exclude);
             let mut device = open_device(&cli)?;
-            let stats = device.sync(local, remote, *dry_run).map_err(|e| anyhow::anyhow!(e))?;
+            let stats = device.sync(local, remote, *dry_run, &excludes).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
                 struct R { success: bool, dry_run: bool, uploaded: usize, downloaded: usize, deleted: usize }
@@ -424,13 +444,14 @@ fn main() -> Result<()> {
                     stats.uploaded, stats.downloaded, stats.deleted);
             }
         }
-        Command::Diff { local, remote } => {
+        Command::Diff { local, remote, exclude } => {
             let local_path = Path::new(local);
-            if !local_path.exists() || !local_path.is_dir() {
-                return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
+            if !local_path.exists() {
+                return Err(MpError::InvalidInput(format!("path not found: {}", local)).into());
             }
+            let excludes = build_excludes(exclude);
             let mut device = open_device(&cli)?;
-            let diff = device.diff(local, remote).map_err(|e| anyhow::anyhow!(e))?;
+            let diff = device.diff(local, remote, &excludes).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 print_output_pretty(true, &diff);
             } else if diff.entries.is_empty() {
