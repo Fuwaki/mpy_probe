@@ -59,15 +59,12 @@ impl SerialConnection {
 
         let candidates: Vec<_> = ports
             .iter()
-            .filter(|p| {
-                let name = &p.port_name;
-                name.contains("ttyACM") || name.contains("ttyUSB")
-            })
+            .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(_)))
             .collect();
 
         match candidates.len() {
             0 => Err(MpError::Connection(
-                "no MicroPython device found (no ttyACM/ttyUSB ports)".into(),
+                "no MicroPython device found (no USB serial ports)".into(),
             )),
             1 => Ok(candidates[0].port_name.clone()),
             _ => {
