@@ -114,7 +114,7 @@ impl<C: Connection> Device<C> {
     pub fn run_file(&mut self, path: &str) -> Result<ExecResult> {
         let path = py_str_repr(path);
         let code = format!(
-            "import sys\ntry:\n    exec(open({path}).read(), {{'__name__':'__main__','__file__':{path}}})\nexcept Exception as e:\n    sys.print_exception(e)",
+            "exec(open({path}).read(), {{'__name__':'__main__','__file__':{path}}})",
         );
         self.exec(&code)
     }
