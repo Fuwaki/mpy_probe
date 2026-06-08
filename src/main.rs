@@ -1,6 +1,7 @@
 mod connection;
 mod device;
 mod error;
+mod include;
 mod protocol;
 
 use std::io::{self, Write};
@@ -12,6 +13,7 @@ use clap::{Parser, Subcommand};
 use connection::SerialConnection;
 use device::{Device, DEFAULT_EXCLUDES};
 use error::MpError;
+use include::IncludeFilter;
 
 /// Build the full excludes list: default excludes + user-provided extras.
 fn build_excludes(user_excludes: &[String]) -> Vec<&str> {
@@ -20,6 +22,32 @@ fn build_excludes(user_excludes: &[String]) -> Vec<&str> {
         excludes.push(e.as_str());
     }
     excludes
+}
+
+/// Try to load a `.mpyinclude` file from the local directory.
+/// If found and user provided `--exclude` flags, print a warning and ignore them.
+/// Returns (excludes, include_filter).
+fn resolve_filter(
+    local_dir: &Path,
+    user_excludes: &[String],
+    json: bool,
+) -> Result<(Vec<String>, Option<IncludeFilter>)> {
+    let include = IncludeFilter::load(local_dir)?;
+
+    if include.is_some() {
+        // .mpyinclude found — warn if --exclude was also provided
+        if !user_excludes.is_empty() && !json {
+            eprintln!(
+                "Warning: .mpyinclude found, --exclude flags are ignored"
+            );
+        }
+        // Only use default excludes (ignore user --exclude)
+        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        Ok((excludes, include))
+    } else {
+        let excludes = build_excludes(user_excludes);
+        Ok((excludes.into_iter().map(|s| s.to_string()).collect(), None))
+    }
 }
 
 #[derive(Parser)]
@@ -413,9 +441,10 @@ fn main() -> Result<()> {
             if !local_path.exists() || !local_path.is_dir() {
                 return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
             }
-            let excludes = build_excludes(exclude);
+            let (excludes, include) = resolve_filter(local_path, exclude, cli.json)?;
+            let exclude_refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
             let mut device = open_device(&cli)?;
-            let count = device.put_dir(local, remote, &excludes).map_err(|e| anyhow::anyhow!(e))?;
+            let count = device.put_dir(local, remote, &exclude_refs, include.as_ref(), local_path).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
                 struct R { success: bool, local: String, remote: String, count: usize }
@@ -440,9 +469,10 @@ fn main() -> Result<()> {
             if !local_path.exists() || !local_path.is_dir() {
                 return Err(MpError::InvalidInput(format!("directory not found: {}", local)).into());
             }
-            let excludes = build_excludes(exclude);
+            let (excludes, include) = resolve_filter(local_path, exclude, cli.json)?;
+            let exclude_refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
             let mut device = open_device(&cli)?;
-            let stats = device.sync(local, remote, *dry_run, &excludes).map_err(|e| anyhow::anyhow!(e))?;
+            let stats = device.sync(local, remote, *dry_run, &exclude_refs, include.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
                 struct R { success: bool, dry_run: bool, uploaded: usize, downloaded: usize, deleted: usize }
@@ -466,9 +496,10 @@ fn main() -> Result<()> {
             if !local_path.exists() {
                 return Err(MpError::InvalidInput(format!("path not found: {}", local)).into());
             }
-            let excludes = build_excludes(exclude);
+            let (excludes, include) = resolve_filter(local_path, exclude, cli.json)?;
+            let exclude_refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
             let mut device = open_device(&cli)?;
-            let diff = device.diff(local, remote, &excludes).map_err(|e| anyhow::anyhow!(e))?;
+            let diff = device.diff(local, remote, &exclude_refs, include.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 print_output_pretty(true, &diff);
             } else if diff.entries.is_empty() {

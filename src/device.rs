@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::connection::Connection;
 use crate::error::{MpError, Result};
+use crate::include::IncludeFilter;
 use crate::protocol::{ExecResult, ReplSession};
 
 /// Default directory names to exclude from local file collection.
@@ -450,7 +451,14 @@ impl<C: Connection> Device<C> {
 
     /// Upload a local directory recursively to the device.
     /// Returns the number of files uploaded.
-    pub fn put_dir(&mut self, local_dir: &str, remote_dir: &str, excludes: &[&str]) -> Result<usize> {
+    pub fn put_dir(
+        &mut self,
+        local_dir: &str,
+        remote_dir: &str,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+        base_dir: &Path,
+    ) -> Result<usize> {
         let local_path = Path::new(local_dir);
         let mut count = 0;
 
@@ -476,8 +484,26 @@ impl<C: Connection> Device<C> {
             );
 
             if local_file.is_dir() {
-                count += self.put_dir(&local_file.to_string_lossy(), &remote_file, excludes)?;
+                // Always recurse into directories — a matching file might be deeper
+                count += self.put_dir(
+                    &local_file.to_string_lossy(),
+                    &remote_file,
+                    excludes,
+                    include,
+                    base_dir,
+                )?;
             } else {
+                // Check include filter if active
+                if let Some(filter) = include {
+                    let rel = local_file
+                        .strip_prefix(base_dir)
+                        .unwrap_or(&local_file)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if !filter.is_match(&rel) {
+                        continue;
+                    }
+                }
                 self.write_file(&local_file.to_string_lossy(), &remote_file)?;
                 count += 1;
             }
@@ -522,15 +548,22 @@ impl<C: Connection> Device<C> {
     /// Sync local directory to device. Uploads new/changed files, deletes
     /// remote files that don't exist locally. If dry_run is true, only report
     /// what would be done without making changes.
-    pub fn sync(&mut self, local_dir: &str, remote_dir: &str, dry_run: bool, excludes: &[&str]) -> Result<SyncStats> {
+    pub fn sync(
+        &mut self,
+        local_dir: &str,
+        remote_dir: &str,
+        dry_run: bool,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+    ) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
         let local_path = Path::new(local_dir);
 
         // Build set of local files
-        let local_files = self.collect_local_files(local_path, "", excludes)?;
+        let local_files = self.collect_local_files(local_path, "", excludes, include)?;
 
         // Build set of remote files
-        let remote_files = self.collect_remote_files(remote_dir, excludes)?;
+        let remote_files = self.collect_remote_files(remote_dir, excludes, include)?;
 
         // Upload new/changed files
         for (rel_path, local_file) in &local_files {
@@ -582,7 +615,13 @@ impl<C: Connection> Device<C> {
 
     /// Compare local and remote, returning a list of differences.
     /// Supports both single files and directories.
-    pub fn diff(&mut self, local_path: &str, remote_path: &str, excludes: &[&str]) -> Result<DiffResult> {
+    pub fn diff(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+    ) -> Result<DiffResult> {
         let local = Path::new(local_path);
 
         // Single file diff
@@ -624,8 +663,8 @@ impl<C: Connection> Device<C> {
         }
 
         // Directory diff
-        let local_files = self.collect_local_files(local, "", excludes)?;
-        let remote_files = self.collect_remote_files(remote_path, excludes)?;
+        let local_files = self.collect_local_files(local, "", excludes, include)?;
+        let remote_files = self.collect_remote_files(remote_path, excludes, include)?;
 
         let mut entries = Vec::new();
         let mut new_count = 0;
@@ -688,7 +727,13 @@ impl<C: Connection> Device<C> {
     }
 
     /// Recursively collect local files as (relative_path, absolute_path).
-    fn collect_local_files(&self, base: &Path, rel: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+    fn collect_local_files(
+        &self,
+        base: &Path,
+        rel: &str,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+    ) -> Result<std::collections::HashMap<String, String>> {
         let mut map = std::collections::HashMap::new();
         let dir = if rel.is_empty() { base.to_path_buf() } else { base.join(rel) };
 
@@ -710,8 +755,15 @@ impl<C: Connection> Device<C> {
             };
 
             if entry.path().is_dir() {
-                map.extend(self.collect_local_files(base, &rel_path, excludes)?);
+                // Always recurse — a matching file might be deeper
+                map.extend(self.collect_local_files(base, &rel_path, excludes, include)?);
             } else {
+                // Check include filter if active
+                if let Some(filter) = include {
+                    if !filter.is_match(&rel_path) {
+                        continue;
+                    }
+                }
                 map.insert(rel_path, entry.path().to_string_lossy().to_string());
             }
         }
@@ -720,11 +772,22 @@ impl<C: Connection> Device<C> {
     }
 
     /// Recursively collect remote files as (relative_path, FileStat).
-    fn collect_remote_files(&mut self, remote_dir: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, FileStat>> {
-        self.collect_remote_files_inner(remote_dir, remote_dir, excludes)
+    fn collect_remote_files(
+        &mut self,
+        remote_dir: &str,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+    ) -> Result<std::collections::HashMap<String, FileStat>> {
+        self.collect_remote_files_inner(remote_dir, remote_dir, excludes, include)
     }
 
-    fn collect_remote_files_inner(&mut self, root_dir: &str, remote_dir: &str, excludes: &[&str]) -> Result<std::collections::HashMap<String, FileStat>> {
+    fn collect_remote_files_inner(
+        &mut self,
+        root_dir: &str,
+        remote_dir: &str,
+        excludes: &[&str],
+        include: Option<&IncludeFilter>,
+    ) -> Result<std::collections::HashMap<String, FileStat>> {
         let mut map = std::collections::HashMap::new();
         let entries = match self.list_dir(remote_dir) {
             Ok(e) => e,
@@ -742,12 +805,20 @@ impl<C: Connection> Device<C> {
             );
             match self.stat(&remote_path) {
                 Ok(s) if s.is_dir => {
-                    map.extend(self.collect_remote_files_inner(root_dir, &remote_path, excludes)?);
+                    // Always recurse — a matching file might be deeper
+                    map.extend(self.collect_remote_files_inner(root_dir, &remote_path, excludes, include)?);
                 }
                 Ok(s) => {
-                    let rel = remote_path.strip_prefix(&format!("{}/", root_dir.trim_end_matches('/')))
+                    let rel = remote_path
+                        .strip_prefix(&format!("{}/", root_dir.trim_end_matches('/')))
                         .unwrap_or(name)
                         .to_string();
+                    // Check include filter if active
+                    if let Some(filter) = include {
+                        if !filter.is_match(&rel) {
+                            continue;
+                        }
+                    }
                     map.insert(rel, s);
                 }
                 Err(_) => {}
