@@ -39,6 +39,19 @@ pub struct SyncStats {
     pub uploaded: usize,
     pub downloaded: usize,
     pub deleted: usize,
+    /// Per-file actions taken (or would-be-taken in dry-run mode).
+    pub actions: Vec<SyncAction>,
+}
+
+/// A single file action performed (or proposed) during sync.
+#[derive(Debug, serde::Serialize)]
+pub struct SyncAction {
+    /// Relative path of the file.
+    pub path: String,
+    /// What happened: "upload", "delete".
+    pub action: String,
+    /// File size in bytes (for uploads: local size; for deletes: remote size).
+    pub size: u64,
 }
 
 /// A single file difference between local and remote.
@@ -584,6 +597,9 @@ impl<C: Connection> Device<C> {
             };
 
             if needs_upload {
+                let local_meta = fs::metadata(local_file).map_err(|e| {
+                    MpError::Filesystem(e.to_string())
+                })?;
                 if !dry_run {
                     // Ensure parent directory exists
                     if let Some(parent) = Path::new(&remote_path).parent() {
@@ -591,12 +607,17 @@ impl<C: Connection> Device<C> {
                     }
                     self.write_file(local_file, &remote_path)?;
                 }
+                stats.actions.push(SyncAction {
+                    path: rel_path.clone(),
+                    action: "upload".to_string(),
+                    size: local_meta.len(),
+                });
                 stats.uploaded += 1;
             }
         }
 
         // Delete remote files not present locally
-        for rel_path in remote_files.keys() {
+        for (rel_path, remote_stat) in &remote_files {
             if !local_files.contains_key(rel_path) {
                 if !dry_run {
                     let remote_path = format!(
@@ -606,6 +627,11 @@ impl<C: Connection> Device<C> {
                     );
                     let _ = self.remove(&remote_path);
                 }
+                stats.actions.push(SyncAction {
+                    path: rel_path.clone(),
+                    action: "delete".to_string(),
+                    size: remote_stat.size,
+                });
                 stats.deleted += 1;
             }
         }

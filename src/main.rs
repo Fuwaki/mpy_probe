@@ -475,20 +475,42 @@ fn main() -> Result<()> {
             let stats = device.sync(local, remote, *dry_run, &exclude_refs, include.as_ref()).map_err(|e| anyhow::anyhow!(e))?;
             if cli.json {
                 #[derive(serde::Serialize)]
-                struct R { success: bool, dry_run: bool, uploaded: usize, downloaded: usize, deleted: usize }
+                struct R { success: bool, dry_run: bool, uploaded: usize, downloaded: usize, deleted: usize, actions: Vec<device::SyncAction> }
                 print_output(true, &R {
                     success: true,
                     dry_run: *dry_run,
                     uploaded: stats.uploaded,
                     downloaded: stats.downloaded,
                     deleted: stats.deleted,
+                    actions: stats.actions,
                 });
-            } else if *dry_run {
-                eprintln!("Dry run — {} would upload, {} would delete",
-                    stats.uploaded, stats.deleted);
             } else {
-                eprintln!("Sync complete: {} uploaded, {} downloaded, {} deleted",
-                    stats.uploaded, stats.downloaded, stats.deleted);
+                for action in &stats.actions {
+                    match action.action.as_str() {
+                        "upload" => {
+                            if *dry_run {
+                                eprintln!("  + {} ({} bytes, would upload)", action.path, action.size);
+                            } else {
+                                eprintln!("  + {} ({} bytes)", action.path, action.size);
+                            }
+                        }
+                        "delete" => {
+                            if *dry_run {
+                                eprintln!("  - {} (would delete)", action.path);
+                            } else {
+                                eprintln!("  - {}", action.path);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if *dry_run {
+                    eprintln!("Dry run — {} would upload, {} would delete",
+                        stats.uploaded, stats.deleted);
+                } else {
+                    eprintln!("Sync complete: {} uploaded, {} deleted",
+                        stats.uploaded, stats.deleted);
+                }
             }
         }
         Command::Diff { local, remote, exclude } => {
