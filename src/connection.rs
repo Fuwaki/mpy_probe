@@ -39,9 +39,9 @@ pub struct SerialConnection {
 }
 
 impl SerialConnection {
-    pub fn open(port_path: &str, baud: u32) -> Result<Self> {
+    pub fn open_with_timeout(port_path: &str, baud: u32, timeout: Duration) -> Result<Self> {
         let port = serialport::new(port_path, baud)
-            .timeout(Duration::from_secs(10))
+            .timeout(timeout)
             .open()
             .map_err(|e| MpError::Connection(format!("failed to open {}: {}", port_path, e)))?;
 

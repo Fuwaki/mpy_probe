@@ -20,7 +20,6 @@ const RAW_PASTE_SUPPORTED: &[u8] = b"R\x01";
 const RAW_PASTE_REJECTED: &[u8] = b"R\x00";
 
 // Defaults
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK_SIZE: usize = 256;
 const CHUNK_DELAY: Duration = Duration::from_millis(2);
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,15 +63,17 @@ pub struct ReplSession<C: Connection> {
     use_raw_paste: bool,
     submit_mode: SubmitMode,
     in_raw_repl: bool,
+    timeout: Duration,
 }
 
 impl<C: Connection> ReplSession<C> {
-    pub fn new(conn: C) -> Self {
+    pub fn with_timeout(conn: C, timeout: Duration) -> Self {
         Self {
             conn,
             use_raw_paste: true,
             submit_mode: SubmitMode::RawPaste,
             in_raw_repl: false,
+            timeout,
         }
     }
 
@@ -125,15 +126,15 @@ impl<C: Connection> ReplSession<C> {
         self.conn.write_all(&[CTRL_A])?;
 
         // Wait for raw REPL banner
-        self.conn.read_until(RAW_REPL_BANNER, DEFAULT_TIMEOUT)?;
+        self.conn.read_until(RAW_REPL_BANNER, self.timeout)?;
 
         if soft_reset {
             // Trigger soft reset
             self.conn.write_all(&[CTRL_D])?;
             // Wait for soft reboot message
-            self.conn.read_until(b"soft reboot\r\n", DEFAULT_TIMEOUT)?;
+            self.conn.read_until(b"soft reboot\r\n", self.timeout)?;
             // Wait for banner again (device comes back to raw REPL)
-            self.conn.read_until(RAW_REPL_BANNER, DEFAULT_TIMEOUT)?;
+            self.conn.read_until(RAW_REPL_BANNER, self.timeout)?;
         }
 
         self.in_raw_repl = true;
@@ -210,11 +211,13 @@ impl<C: Connection> ReplSession<C> {
             // may have sent error output. Consume until we see the raw
             // prompt ">" to get back to a clean state.
             let _ = self.conn.read_until(b">", Duration::from_secs(3));
-            return Err(MpError::Protocol("device does not support raw-paste".into()));
+            return Err(MpError::Protocol(
+                "device does not support raw-paste".into(),
+            ));
         }
 
         // Device supports raw-paste! Read window size (2 bytes, LE)
-        let win_bytes = self.conn.read_exact(2, DEFAULT_TIMEOUT)?;
+        let win_bytes = self.conn.read_exact(2, self.timeout)?;
         let window_size = u16::from_le_bytes([win_bytes[0], win_bytes[1]]) as usize;
 
         // Some devices send an extra byte after the window size.
@@ -229,7 +232,7 @@ impl<C: Connection> ReplSession<C> {
 
         while offset < code.len() {
             if window_remain == 0 || !self.conn.incoming_is_empty() {
-                let ctrl = self.conn.read_exact(1, DEFAULT_TIMEOUT)?;
+                let ctrl = self.conn.read_exact(1, self.timeout)?;
                 match ctrl[0] {
                     CTRL_A => {
                         // Grant: refill window
@@ -266,7 +269,7 @@ impl<C: Connection> ReplSession<C> {
         // sending the last batch of data. Drain any stale CTRL-A bytes
         // before expecting the CTRL-D ack.
         loop {
-            let ack = self.conn.read_exact(1, DEFAULT_TIMEOUT)?;
+            let ack = self.conn.read_exact(1, self.timeout)?;
             match ack[0] {
                 CTRL_D => break,
                 CTRL_A => continue, // stale flow control, ignore
@@ -291,7 +294,7 @@ impl<C: Connection> ReplSession<C> {
         self.conn.write_all(&[CTRL_D])?;
 
         // Expect "OK"
-        let resp = self.conn.read_exact(2, DEFAULT_TIMEOUT)?;
+        let resp = self.conn.read_exact(2, self.timeout)?;
         if resp != OK_RESP {
             return Err(MpError::Protocol(format!(
                 "expected OK after raw submit, got {:?}",
@@ -307,7 +310,7 @@ impl<C: Connection> ReplSession<C> {
         // Enter paste mode
         self.conn.write_all(&[CTRL_E])?;
         // Wait for paste prompt
-        self.conn.read_until(b"=== ", DEFAULT_TIMEOUT)?;
+        self.conn.read_until(b"=== ", self.timeout)?;
 
         // Send code in chunks
         for chunk in code.chunks(CHUNK_SIZE) {
@@ -318,7 +321,7 @@ impl<C: Connection> ReplSession<C> {
         // End paste
         self.conn.write_all(&[CTRL_D])?;
         // Wait for execution to complete
-        self.conn.read_until(b"\r\n", DEFAULT_TIMEOUT)?;
+        self.conn.read_until(b"\r\n", self.timeout)?;
 
         Ok(())
     }

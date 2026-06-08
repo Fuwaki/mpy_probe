@@ -10,7 +10,12 @@ use crate::protocol::{ExecResult, ReplSession};
 
 /// Default directory names to exclude from local file collection.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
-    ".git", "__pycache__", ".DS_Store", "node_modules", ".vscode", ".idea",
+    ".git",
+    "__pycache__",
+    ".DS_Store",
+    "node_modules",
+    ".vscode",
+    ".idea",
 ];
 
 /// Device information returned by `device_info()`.
@@ -58,7 +63,7 @@ pub struct SyncAction {
 #[derive(Debug, serde::Serialize)]
 pub struct DiffEntry {
     pub path: String,
-    pub status: String,  // "new", "changed", "deleted"
+    pub status: String, // "new", "changed", "deleted"
     pub local_size: Option<u64>,
     pub remote_size: Option<u64>,
 }
@@ -79,9 +84,9 @@ pub struct Device<C: Connection> {
 }
 
 impl<C: Connection> Device<C> {
-    pub fn new(conn: C) -> Self {
+    pub fn new_with_timeout(conn: C, timeout: Duration) -> Self {
         Self {
-            session: ReplSession::new(conn),
+            session: ReplSession::with_timeout(conn, timeout),
             chunk_size: 128,
         }
     }
@@ -107,18 +112,17 @@ impl<C: Connection> Device<C> {
 
     /// Run a file on the device (execfile-style).
     pub fn run_file(&mut self, path: &str) -> Result<ExecResult> {
+        let path = py_str_repr(path);
         let code = format!(
-            "import sys\ntry:\n    exec(open('{p}').read(), {{'__name__':'__main__','__file__':'{p}'}})\nexcept Exception as e:\n    sys.print_exception(e)",
-            p = path
+            "import sys\ntry:\n    exec(open({path}).read(), {{'__name__':'__main__','__file__':{path}}})\nexcept Exception as e:\n    sys.print_exception(e)",
         );
         self.exec(&code)
     }
 
     /// Upload a local file to the device.
     pub fn write_file(&mut self, local_path: &str, remote_path: &str) -> Result<()> {
-        let data = std::fs::read(local_path).map_err(|e| {
-            MpError::Filesystem(format!("failed to read {}: {}", local_path, e))
-        })?;
+        let data = std::fs::read(local_path)
+            .map_err(|e| MpError::Filesystem(format!("failed to read {}: {}", local_path, e)))?;
 
         self.write_file_bytes(remote_path, &data)
     }
@@ -129,7 +133,7 @@ impl<C: Connection> Device<C> {
     /// to send them in a single raw REPL session with raw-paste flow control.
     /// This avoids overflowing the device's input buffer for large files.
     pub fn write_file_bytes(&mut self, remote_path: &str, data: &[u8]) -> Result<()> {
-        let escaped_path = remote_path.replace('\'', "\\'");
+        let remote_path = py_str_repr(remote_path);
 
         // Each batch writes batch_chunks worth of data (e.g. 128 * 16 = 2048 bytes).
         // The resulting Python script stays small enough for the device to handle.
@@ -138,10 +142,7 @@ impl<C: Connection> Device<C> {
 
         if chunks.is_empty() {
             // Empty file: just create it
-            let code = format!(
-                "__f=open('{}','wb')\n__f.flush()\n__f.close()\n",
-                escaped_path
-            );
+            let code = format!("__f=open({},'wb')\n__f.flush()\n__f.close()\n", remote_path);
             let result = self.exec(&code)?;
             if result.is_error() {
                 return Err(MpError::Execution {
@@ -157,7 +158,7 @@ impl<C: Connection> Device<C> {
         for (i, batch) in chunks.chunks(batch_chunks).enumerate() {
             let mut code = String::new();
             if i == 0 {
-                code.push_str(&format!("__f=open('{}','wb')\n", escaped_path));
+                code.push_str(&format!("__f=open({},'wb')\n", remote_path));
             }
             for chunk in batch {
                 let hex: String = chunk.iter().map(|b| format!("{:02x}", b)).collect();
@@ -191,18 +192,19 @@ impl<C: Connection> Device<C> {
     /// Uses a single exec call with a Python loop to read all chunks,
     /// separated by a unique delimiter for reliable parsing.
     pub fn read_file(&mut self, remote_path: &str) -> Result<Vec<u8>> {
-        let escaped_path = remote_path.replace('\'', "\\'");
+        let remote_path = py_str_repr(remote_path);
         let chunk_size = self.chunk_size;
 
-        // Single exec: open, read all chunks with delimiter, close
+        // Single exec: open, read all chunks as hex lines, close.
         let code = format!(
-            "__f=open('{}','rb')\n\
+            "import binascii\n\
+             __f=open({},'rb')\n\
              while True:\n\
              \x20 __d=__f.read({})\n\
              \x20 if not __d:break\n\
-             \x20 print(repr(__d))\n\
+             \x20 print(binascii.hexlify(__d).decode())\n\
              __f.close()",
-            escaped_path, chunk_size
+            remote_path, chunk_size
         );
 
         let result = self.exec(&code)?;
@@ -218,10 +220,10 @@ impl<C: Connection> Device<C> {
 
         for line in output.lines() {
             let line = line.trim();
-            if line.is_empty() || line == "b''" {
+            if line.is_empty() {
                 continue;
             }
-            let chunk = parse_py_bytes_literal(line)?;
+            let chunk = parse_hex_bytes(line)?;
             bytes.extend_from_slice(&chunk);
         }
 
@@ -231,9 +233,8 @@ impl<C: Connection> Device<C> {
     /// Download a file from the device and write to local path.
     pub fn get_file(&mut self, remote_path: &str, local_path: &str) -> Result<()> {
         let data = self.read_file(remote_path)?;
-        std::fs::write(local_path, &data).map_err(|e| {
-            MpError::Filesystem(format!("failed to write {}: {}", local_path, e))
-        })?;
+        std::fs::write(local_path, &data)
+            .map_err(|e| MpError::Filesystem(format!("failed to write {}: {}", local_path, e)))?;
         Ok(())
     }
 
@@ -245,7 +246,11 @@ impl<C: Connection> Device<C> {
 
     /// List files in a directory on the device.
     pub fn list_dir(&mut self, path: &str) -> Result<Vec<String>> {
-        let code = format!("import os; print(repr(os.listdir('{}')))", path.replace('\'', "\\'"));
+        let path = py_str_repr(path);
+        let code = format!(
+            "import os,binascii\nfor __n in os.listdir({}):\n print(binascii.hexlify(__n.encode()).decode())",
+            path
+        );
         let result = self.exec(&code)?;
         if result.is_error() {
             return Err(MpError::Execution {
@@ -253,13 +258,17 @@ impl<C: Connection> Device<C> {
                 stderr: result.stderr_str(),
             });
         }
-        let repr = result.stdout_str().trim_end_matches("\r\n").to_string();
-        parse_py_list_of_strings(&repr)
+        result
+            .stdout_str()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| parse_hex_string(line.trim()))
+            .collect()
     }
 
     /// Remove a file on the device.
     pub fn remove(&mut self, path: &str) -> Result<()> {
-        let code = format!("import os; os.remove('{}')", path.replace('\'', "\\'"));
+        let code = format!("import os; os.remove({})", py_str_repr(path));
         let result = self.exec(&code)?;
         if result.is_error() {
             let stderr = result.stderr_str();
@@ -278,8 +287,8 @@ impl<C: Connection> Device<C> {
     pub fn mkdir(&mut self, path: &str) -> Result<()> {
         // Create directory and all parents, ignore if already exists.
         let code = format!(
-            "import os\np='{}'\nfor i in range(1,len(p.split('/'))+1):\n d='/'.join(p.split('/')[:i]) or '/'\n try: os.mkdir(d)\n except: pass",
-            path.replace('\'', "\\'")
+            "import os\np={}\nfor i in range(1,len(p.split('/'))+1):\n d='/'.join(p.split('/')[:i]) or '/'\n try: os.mkdir(d)\n except: pass",
+            py_str_repr(path)
         );
         let result = self.exec(&code)?;
         if result.is_error() {
@@ -312,18 +321,33 @@ impl<C: Connection> Device<C> {
                 // Read data from device -> write to stdout
                 match conn.read_all_available() {
                     Ok(data) if !data.is_empty() => {
-                        stdout.write_all(&data).map_err(|e| MpError::Connection(e.to_string()))?;
-                        stdout.flush().map_err(|e| MpError::Connection(e.to_string()))?;
+                        stdout
+                            .write_all(&data)
+                            .map_err(|e| MpError::Connection(e.to_string()))?;
+                        stdout
+                            .flush()
+                            .map_err(|e| MpError::Connection(e.to_string()))?;
                     }
                     _ => {}
                 }
 
                 // Check for stdin key events (non-blocking)
-                if event::poll(Duration::from_millis(0)).map_err(|e| MpError::Connection(format!("poll: {}", e)))? {
-                    if let Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) = event::read().map_err(|e| MpError::Connection(format!("read: {}", e)))? {
+                if event::poll(Duration::from_millis(0))
+                    .map_err(|e| MpError::Connection(format!("poll: {}", e)))?
+                {
+                    if let Event::Key(KeyEvent {
+                        code,
+                        modifiers,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }) =
+                        event::read().map_err(|e| MpError::Connection(format!("read: {}", e)))?
+                    {
                         match code {
                             // Ctrl-D exits REPL
-                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => break,
+                            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                                break
+                            }
                             // Ctrl-<char> -> control character (0x01..0x1a)
                             KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
                                 let byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
@@ -416,14 +440,13 @@ impl<C: Connection> Device<C> {
 
     /// Get file/directory status on the device.
     pub fn stat(&mut self, path: &str) -> Result<FileStat> {
-        let escaped = path.replace('\'', "\\'");
         let code = format!(
             "import os\n\
-             s=os.stat('{}')\n\
+             s=os.stat({})\n\
              print('mode:' + str(s[0]))\n\
              print('size:' + str(s[6]))\n\
              print('mtime:' + str(s[8]))",
-            escaped
+            py_str_repr(path)
         );
         let result = self.exec(&code)?;
         if result.is_error() {
@@ -478,9 +501,9 @@ impl<C: Connection> Device<C> {
         // Ensure remote directory exists
         let _ = self.mkdir(remote_dir);
 
-        for entry in fs::read_dir(local_path).map_err(|e| {
-            MpError::Filesystem(format!("failed to read {}: {}", local_dir, e))
-        })? {
+        for entry in fs::read_dir(local_path)
+            .map_err(|e| MpError::Filesystem(format!("failed to read {}: {}", local_dir, e)))?
+        {
             let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
             let file_name = entry.file_name().to_string_lossy().to_string();
 
@@ -490,11 +513,7 @@ impl<C: Connection> Device<C> {
             }
 
             let local_file = entry.path();
-            let remote_file = format!(
-                "{}/{}",
-                remote_dir.trim_end_matches('/'),
-                file_name
-            );
+            let remote_file = format!("{}/{}", remote_dir.trim_end_matches('/'), file_name);
 
             if local_file.is_dir() {
                 // Always recurse into directories — a matching file might be deeper
@@ -529,19 +548,14 @@ impl<C: Connection> Device<C> {
     /// Returns the number of files downloaded.
     pub fn get_dir(&mut self, remote_dir: &str, local_dir: &str) -> Result<usize> {
         let local_path = Path::new(local_dir);
-        fs::create_dir_all(local_path).map_err(|e| {
-            MpError::Filesystem(format!("failed to create {}: {}", local_dir, e))
-        })?;
+        fs::create_dir_all(local_path)
+            .map_err(|e| MpError::Filesystem(format!("failed to create {}: {}", local_dir, e)))?;
 
         let entries = self.list_dir(remote_dir)?;
         let mut count = 0;
 
         for name in &entries {
-            let remote_path = format!(
-                "{}/{}",
-                remote_dir.trim_end_matches('/'),
-                name
-            );
+            let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
             let local_file = local_path.join(name);
 
             match self.stat(&remote_path) {
@@ -580,26 +594,20 @@ impl<C: Connection> Device<C> {
 
         // Upload new/changed files
         for (rel_path, local_file) in &local_files {
-            let remote_path = format!(
-                "{}/{}",
-                remote_dir.trim_end_matches('/'),
-                rel_path
-            );
+            let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), rel_path);
 
             let needs_upload = match remote_files.get(rel_path) {
                 None => true,
                 Some(remote_stat) => {
-                    let local_meta = fs::metadata(local_file).map_err(|e| {
-                        MpError::Filesystem(e.to_string())
-                    })?;
+                    let local_meta =
+                        fs::metadata(local_file).map_err(|e| MpError::Filesystem(e.to_string()))?;
                     local_meta.len() != remote_stat.size
                 }
             };
 
             if needs_upload {
-                let local_meta = fs::metadata(local_file).map_err(|e| {
-                    MpError::Filesystem(e.to_string())
-                })?;
+                let local_meta =
+                    fs::metadata(local_file).map_err(|e| MpError::Filesystem(e.to_string()))?;
                 if !dry_run {
                     // Ensure parent directory exists
                     if let Some(parent) = Path::new(&remote_path).parent() {
@@ -620,12 +628,8 @@ impl<C: Connection> Device<C> {
         for (rel_path, remote_stat) in &remote_files {
             if !local_files.contains_key(rel_path) {
                 if !dry_run {
-                    let remote_path = format!(
-                        "{}/{}",
-                        remote_dir.trim_end_matches('/'),
-                        rel_path
-                    );
-                    let _ = self.remove(&remote_path);
+                    let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), rel_path);
+                    self.remove(&remote_path)?;
                 }
                 stats.actions.push(SyncAction {
                     path: rel_path.clone(),
@@ -652,14 +656,17 @@ impl<C: Connection> Device<C> {
 
         // Single file diff
         if local.is_file() {
-            let file_name = local.file_name()
+            let file_name = local
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let remote_file = format!("{}/{}", remote_path.trim_end_matches('/'), file_name);
+            let remote_file = if remote_path.ends_with('/') {
+                format!("{}{}", remote_path, file_name)
+            } else {
+                remote_path.to_string()
+            };
 
-            let local_meta = fs::metadata(local).map_err(|e| {
-                MpError::Filesystem(e.to_string())
-            })?;
+            let local_meta = fs::metadata(local).map_err(|e| MpError::Filesystem(e.to_string()))?;
             let local_size = local_meta.len();
 
             let mut entries = Vec::new();
@@ -672,7 +679,12 @@ impl<C: Connection> Device<C> {
                             local_size: Some(local_size),
                             remote_size: Some(remote_stat.size),
                         });
-                        return Ok(DiffResult { entries, new_count: 0, changed_count: 1, deleted_count: 0 });
+                        return Ok(DiffResult {
+                            entries,
+                            new_count: 0,
+                            changed_count: 1,
+                            deleted_count: 0,
+                        });
                     }
                 }
                 Err(_) => {
@@ -682,10 +694,20 @@ impl<C: Connection> Device<C> {
                         local_size: Some(local_size),
                         remote_size: None,
                     });
-                    return Ok(DiffResult { entries, new_count: 1, changed_count: 0, deleted_count: 0 });
+                    return Ok(DiffResult {
+                        entries,
+                        new_count: 1,
+                        changed_count: 0,
+                        deleted_count: 0,
+                    });
                 }
             }
-            return Ok(DiffResult { entries, new_count: 0, changed_count: 0, deleted_count: 0 });
+            return Ok(DiffResult {
+                entries,
+                new_count: 0,
+                changed_count: 0,
+                deleted_count: 0,
+            });
         }
 
         // Directory diff
@@ -699,9 +721,8 @@ impl<C: Connection> Device<C> {
 
         // Check local files against remote
         for (rel_path, local_file) in &local_files {
-            let local_meta = fs::metadata(local_file).map_err(|e| {
-                MpError::Filesystem(e.to_string())
-            })?;
+            let local_meta =
+                fs::metadata(local_file).map_err(|e| MpError::Filesystem(e.to_string()))?;
             let local_size = local_meta.len();
 
             match remote_files.get(rel_path) {
@@ -761,11 +782,15 @@ impl<C: Connection> Device<C> {
         include: Option<&IncludeFilter>,
     ) -> Result<std::collections::HashMap<String, String>> {
         let mut map = std::collections::HashMap::new();
-        let dir = if rel.is_empty() { base.to_path_buf() } else { base.join(rel) };
+        let dir = if rel.is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(rel)
+        };
 
-        for entry in fs::read_dir(&dir).map_err(|e| {
-            MpError::Filesystem(format!("failed to read {}: {}", dir.display(), e))
-        })? {
+        for entry in fs::read_dir(&dir)
+            .map_err(|e| MpError::Filesystem(format!("failed to read {}: {}", dir.display(), e)))?
+        {
             let entry = entry.map_err(|e| MpError::Filesystem(e.to_string()))?;
             let name = entry.file_name().to_string_lossy().to_string();
 
@@ -824,15 +849,16 @@ impl<C: Connection> Device<C> {
             if excludes.contains(&name.as_str()) {
                 continue;
             }
-            let remote_path = format!(
-                "{}/{}",
-                remote_dir.trim_end_matches('/'),
-                name
-            );
+            let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
             match self.stat(&remote_path) {
                 Ok(s) if s.is_dir => {
                     // Always recurse — a matching file might be deeper
-                    map.extend(self.collect_remote_files_inner(root_dir, &remote_path, excludes, include)?);
+                    map.extend(self.collect_remote_files_inner(
+                        root_dir,
+                        &remote_path,
+                        excludes,
+                        include,
+                    )?);
                 }
                 Ok(s) => {
                     let rel = remote_path
@@ -855,102 +881,43 @@ impl<C: Connection> Device<C> {
     }
 }
 
-/// Parse a Python bytes literal like `b'\\x01\\x02hello'` into raw bytes.
-fn parse_py_bytes_literal(s: &str) -> Result<Vec<u8>> {
-    // Expecting b'...' or b"..."
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if !s.starts_with("b'") && !s.starts_with("b\"") {
-        // Might be a text string, just return as bytes
-        return Ok(s.as_bytes().to_vec());
+    if !s.len().is_multiple_of(2) {
+        return Err(MpError::Protocol(format!("invalid hex byte string: {}", s)));
     }
 
-    let inner = &s[2..s.len() - 1];
-    let mut result = Vec::new();
-    let mut chars = inner.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('x') => {
-                    let h1 = chars.next().unwrap_or('0');
-                    let h2 = chars.next().unwrap_or('0');
-                    let hex_str = format!("{}{}", h1, h2);
-                    let byte = u8::from_str_radix(&hex_str, 16).unwrap_or(0);
-                    result.push(byte);
-                }
-                Some('n') => result.push(b'\n'),
-                Some('r') => result.push(b'\r'),
-                Some('t') => result.push(b'\t'),
-                Some('\\') => result.push(b'\\'),
-                Some('\'') => result.push(b'\''),
-                Some('"') => result.push(b'"'),
-                Some('0') => result.push(0),
-                Some(other) => {
-                    result.push(b'\\');
-                    result.push(other as u8);
-                }
-                None => result.push(b'\\'),
-            }
-        } else {
-            result.push(c as u8);
-        }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16)
+            .map_err(|e| MpError::Protocol(format!("invalid hex byte string '{}': {}", s, e)))?;
+        bytes.push(byte);
     }
-
-    Ok(result)
+    Ok(bytes)
 }
 
-/// Parse a Python list of strings like `['file1.py', 'file2.py']`.
-fn parse_py_list_of_strings(s: &str) -> Result<Vec<String>> {
-    let s = s.trim();
-    if !s.starts_with('[') || !s.ends_with(']') {
-        return Err(MpError::Protocol(format!(
-            "expected Python list literal, got: {}",
-            s
-        )));
-    }
+fn parse_hex_string(s: &str) -> Result<String> {
+    let bytes = parse_hex_bytes(s)?;
+    String::from_utf8(bytes)
+        .map_err(|e| MpError::Protocol(format!("invalid UTF-8 filename from device: {}", e)))
+}
 
-    let inner = &s[1..s.len() - 1].trim();
-    if inner.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut result = Vec::new();
-    // Simple parser: split by ', ' and strip quotes
-    // Handle the case where strings might contain commas (rare for filenames)
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut quote_char = '\0';
-
-    for c in inner.chars() {
-        if !in_string {
-            if c == '\'' || c == '"' {
-                in_string = true;
-                quote_char = c;
-            } else if c == ',' {
-                let trimmed = current.trim().trim_matches(|c| c == '\'' || c == '"');
-                if !trimmed.is_empty() {
-                    result.push(trimmed.to_string());
-                }
-                current.clear();
-            } else if !c.is_whitespace() {
-                current.push(c);
-            }
-        } else if c == quote_char {
-            in_string = false;
-        } else {
-            current.push(c);
+fn py_str_repr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
         }
     }
-
-    // Last element
-    if !current.is_empty() {
-        let trimmed = current.trim().trim_matches(|c| c == '\'' || c == '"');
-        if !trimmed.is_empty() {
-            result.push(trimmed.to_string());
-        }
-    }
-
-    Ok(result)
+    out.push('\'');
+    out
 }
 
 /// Generate a Python bytes literal from raw bytes.
@@ -974,3 +941,35 @@ fn py_bytes_repr(data: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn py_str_repr_escapes_python_string_boundaries() {
+        assert_eq!(py_str_repr("/flash/a'b\\c.py"), "'/flash/a\\'b\\\\c.py'");
+        assert_eq!(py_str_repr("line\nnext"), "'line\\nnext'");
+    }
+
+    #[test]
+    fn parse_hex_bytes_round_trips_binary_data() {
+        assert_eq!(
+            parse_hex_bytes("000a0d5cfff0").unwrap(),
+            vec![0x00, b'\n', b'\r', b'\\', 0xff, 0xf0]
+        );
+    }
+
+    #[test]
+    fn parse_hex_string_handles_punctuation_in_filenames() {
+        assert_eq!(
+            parse_hex_string("61272c625c632e7079").unwrap(),
+            "a',b\\c.py"
+        );
+    }
+
+    #[test]
+    fn parse_hex_bytes_rejects_invalid_input() {
+        assert!(parse_hex_bytes("abc").is_err());
+        assert!(parse_hex_bytes("xx").is_err());
+    }
+}

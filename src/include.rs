@@ -22,9 +22,8 @@ impl IncludeFilter {
             return Ok(None);
         }
 
-        let content = fs::read_to_string(&include_path).map_err(|e| {
-            anyhow::anyhow!("failed to read {}: {}", include_path.display(), e)
-        })?;
+        let content = fs::read_to_string(&include_path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {}", include_path.display(), e))?;
 
         let filter = Self::parse(&content)?;
         Ok(Some(filter))
@@ -74,9 +73,9 @@ impl IncludeFilter {
             anyhow::bail!(".mpyinclude contains no valid patterns");
         }
 
-        let matcher = builder.build().map_err(|e| {
-            anyhow::anyhow!("failed to build glob matcher: {}", e)
-        })?;
+        let matcher = builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build glob matcher: {}", e))?;
 
         Ok(IncludeFilter { matcher })
     }
